@@ -1,14 +1,10 @@
 from typing import List
-
 from kfp import dsl
-
-PYTHON_BASE_IMAGE = "registry.access.redhat.com/ubi9/python-311:9.6-1755074620"
-DOCLING_BASE_IMAGE = "quay.io/fabianofranz/docling-ubi9:2.45.0"
-
+from .constants import PYTHON_BASE_IMAGE, DOCLING_BASE_IMAGE
 
 @dsl.component(
     base_image=PYTHON_BASE_IMAGE,
-    packages_to_install=["boto3","requests"],
+    packages_to_install=["boto3", "requests"], # Required for S3 and HTTP downloads
 )
 def import_pdfs(
     output_path: dsl.Output[dsl.Artifact],
@@ -27,20 +23,18 @@ def import_pdfs(
         from_s3: Whether or not to import from S3.
         s3_secret_mount_path: Path to the secret mount path for the S3 credentials.
     """
-
-    import boto3 # pylint: disable=import-outside-toplevel  # noqa: PLC0415, E402
+    import boto3 # pylint: disable=import-outside-toplevel
     import os # pylint: disable=import-outside-toplevel
-    from pathlib import Path # pylint: disable=import-outside-toplevel  # noqa: PLC0415, E402
-    import requests # pylint: disable=import-outside-toplevel  # noqa: PLC0415, E402
+    from pathlib import Path # pylint: disable=import-outside-toplevel
+    import requests # pylint: disable=import-outside-toplevel
 
     filenames_list = [name.strip() for name in filenames.split(",") if name.strip()]
-
     if not filenames_list:
         raise ValueError("filenames must contain at least one filename (comma-separated)")
 
     output_path_p = Path(output_path.path)
     output_path_p.mkdir(parents=True, exist_ok=True)
-
+        
     if from_s3:
         if not os.path.exists(s3_secret_mount_path):
             raise ValueError(f"Secret for S3 should be mounted in {s3_secret_mount_path}")
@@ -97,7 +91,7 @@ def import_pdfs(
             aws_access_key_id=s3_access_key,
             aws_secret_access_key=s3_secret_key,
         )
-
+        
         for filename in filenames_list:
             orig = f"{s3_prefix.rstrip('/')}/{filename.lstrip('/')}"
             dest = output_path_p / filename
@@ -117,6 +111,7 @@ def import_pdfs(
                     for chunk in resp.iter_content(chunk_size=8192):
                         if chunk:
                             f.write(chunk)
+    
     print("import-test-pdfs: done", flush=True)
 
 @dsl.component(
@@ -133,7 +128,7 @@ def create_pdf_splits(
         input_path: Path to the input directory containing PDF files.
         num_splits: Number of splits to create.
     """
-    from pathlib import Path # pylint: disable=import-outside-toplevel  # noqa: PLC0415, E402
+    from pathlib import Path # pylint: disable=import-outside-toplevel
 
     input_path_p = Path(input_path.path)
 
@@ -142,28 +137,44 @@ def create_pdf_splits(
     filled_splits = list(filter(None, all_splits))
     return filled_splits
 
-
 @dsl.component(
     base_image=DOCLING_BASE_IMAGE,
 )
 def download_docling_models(
     output_path: dsl.Output[dsl.Artifact],
-    remote_model_endpoint_enabled: bool,
+    pipeline_type: str = "standard",
+    remote_model_endpoint_enabled: bool = False,
 ):
     """
-    Download Docling models.
+    Download Docling models based on pipeline type and configuration.
+
+    This unified component handles model downloading for different pipeline types:
+    - standard : Download traditional Docling models (layout, tableformer, easyocr)
+    - vlm : Download Docling VLM models (smolvlm, smoldocling) for local inference
+    - vlm-remote : Download Docling VLM models for remote inference
 
     Args:
-        output_path: Path to the output directory for Docling models.
+        output_path: Path to the output directory for Docling models
+        pipeline_type: Type of pipeline (standard, vlm)
+        remote_model_endpoint_enabled: Whether to download remote model endpoint models (VLM only)
     """
-    from pathlib import Path # pylint: disable=import-outside-toplevel  # noqa: PLC0415, E402
-    from docling.utils.model_downloader import download_models # pylint: disable=import-outside-toplevel  # noqa: PLC0415, E402
-
+    from pathlib import Path # pylint: disable=import-outside-toplevel
+    from docling.utils.model_downloader import download_models # pylint: disable=import-outside-toplevel
+    
     output_path_p = Path(output_path.path)
-
     output_path_p.mkdir(parents=True, exist_ok=True)
 
-    if remote_model_endpoint_enabled:
+    if pipeline_type == "standard":
+        # Standard pipeline: download traditional models
+        download_models(
+            output_dir=output_path_p,
+            progress=True,
+            with_layout=True,
+            with_tableformer=True,
+            with_easyocr=True,
+        )
+    elif pipeline_type == "vlm" and remote_model_endpoint_enabled:
+        # VLM pipeline with remote model endpoint: Download minimal required models
         # Only models set are what lives in fabianofranz repo
         # TODO: figure out what needs to be downloaded or removed
         download_models(
@@ -180,7 +191,8 @@ def download_docling_models(
             with_granite_vision=False,
             with_easyocr=False,
         )
-    else:
+    elif pipeline_type == "vlm":
+        # VLM pipeline with local models: Download VLM models for local inference
         # TODO: set models downloaded by model name passed into KFP pipeline ex: smoldocling OR granite-vision
         download_models(
             output_dir=output_path_p,
@@ -196,24 +208,33 @@ def download_docling_models(
             with_granite_vision=False,
             with_easyocr=False,
         )
-
+    else:
+        raise ValueError(f"Invalid pipeline_type: {pipeline_type}. Must be 'standard' or 'vlm'")
 
 @dsl.component(
     base_image=DOCLING_BASE_IMAGE,
 )
-def docling_convert(
+def docling_convert_standard(
     input_path: dsl.Input[dsl.Artifact],
     artifacts_path: dsl.Input[dsl.Artifact],
     output_path: dsl.Output[dsl.Artifact],
     pdf_filenames: List[str],
-    num_threads: int = 4,
+    pdf_backend: str = "dlparse_v4",
     image_export_mode: str = "embedded",
+    table_mode: str = "accurate",
+    num_threads: int = 4,
     timeout_per_document: int = 300,
-    remote_model_enabled: bool = False,
-    remote_model_secret_mount_path: str = "/mnt/secrets",
+    ocr: bool = True,
+    force_ocr: bool = False,
+    ocr_engine: str = "tesseract",
+    allow_external_plugins: bool = False,
+    enrich_code: bool = False,
+    enrich_formula: bool = False,
+    enrich_picture_classes: bool = False,
+    enrich_picture_description: bool = False,
 ):
     """
-    Convert a list of PDF files to JSON and Markdown using Docling.
+    Convert a list of PDF files to JSON and Markdown using Docling (Standard Pipeline).
 
     Args:
         input_path: Path to the input directory containing PDF files.
@@ -225,22 +246,190 @@ def docling_convert(
         table_mode: Mode to detect tables.
         num_threads: Number of threads to use per document processing.
         timeout_per_document: Timeout per document processing.
+        ocr: Whether or not to use OCR if needed.
+        force_ocr: Whether or not to force OCR.
+        ocr_engine: Engine to use for OCR.
+        allow_external_plugins: Whether or not to allow external plugins.
+        enrich_code: Whether or not to enrich code.
+        enrich_formula: Whether or not to enrich formula.
+        enrich_picture_classes: Whether or not to enrich picture classes.
+        enrich_picture_description: Whether or not to enrich picture description.
+    """
+    import os # pylint: disable=import-outside-toplevel
+    from importlib import import_module # pylint: disable=import-outside-toplevel
+    from pathlib import Path # pylint: disable=import-outside-toplevel
+
+    from docling_core.types.doc.base import ImageRefMode  # pylint: disable=import-outside-toplevel
+    from docling.datamodel.base_models import InputFormat  # pylint: disable=import-outside-toplevel
+    from docling.datamodel.pipeline_options import (  # pylint: disable=import-outside-toplevel
+        PdfPipelineOptions,
+        PdfBackend,
+        TableFormerMode,
+        EasyOcrOptions,
+        TesseractCliOcrOptions,
+        TesseractOcrOptions,
+        OcrEngine,
+        OcrMacOptions,
+        RapidOcrOptions,
+    )
+    from docling.document_converter import DocumentConverter, PdfFormatOption  # pylint: disable=import-outside-toplevel
+    from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions  # pylint: disable=import-outside-toplevel
+    from docling.pipeline.standard_pdf_pipeline import StandardPdfPipeline # pylint: disable=import-outside-toplevel
+
+    if not pdf_filenames:
+        raise ValueError("pdf_filenames must be provided with the list of file names to process")
+
+    allowed_pdf_backends = {e.value for e in PdfBackend}
+    if pdf_backend not in allowed_pdf_backends:
+        raise ValueError(
+            f"Invalid pdf_backend: {pdf_backend}. Must be one of {sorted(allowed_pdf_backends)}"
+        )
+
+    allowed_table_modes = {e.value for e in TableFormerMode}
+    if table_mode not in allowed_table_modes:
+        raise ValueError(
+            f"Invalid table_mode: {table_mode}. Must be one of {sorted(allowed_table_modes)}"
+        )
+
+    allowed_image_export_modes = {e.value for e in ImageRefMode}
+    if image_export_mode not in allowed_image_export_modes:
+        raise ValueError(
+            f"Invalid image_export_mode: {image_export_mode}. Must be one of {sorted(allowed_image_export_modes)}"
+        )
+    
+    if not allow_external_plugins:
+        allowed_ocr_engines = {e.value for e in OcrEngine}
+        if ocr_engine not in allowed_ocr_engines:
+            raise ValueError(
+                f"Invalid ocr_engine: {ocr_engine}. Must be one of {sorted(allowed_ocr_engines)}"
+            )
+        
+    # Dictionary to map the engine name string to the corresponding class
+    ocr_engine_map = {
+        "easyocr": EasyOcrOptions,
+        "tesseract_cli": TesseractCliOcrOptions,
+        "tesseract": TesseractOcrOptions,
+        "ocrmac": OcrMacOptions,
+        "rapidocr": RapidOcrOptions,
+    }
+
+    input_path_p = Path(input_path.path)
+    artifacts_path_p = Path(artifacts_path.path)
+    output_path_p = Path(output_path.path)
+    output_path_p.mkdir(parents=True, exist_ok=True)
+
+    input_pdfs = [input_path_p / name for name in pdf_filenames]
+    print(f"docling-convert: starting with backend='{pdf_backend}', files={len(input_pdfs)}", flush=True)
+
+    pipeline_options = PdfPipelineOptions()
+    pipeline_options.artifacts_path = artifacts_path_p
+    pipeline_options.do_code_enrichment = enrich_code
+    pipeline_options.do_formula_enrichment = enrich_formula
+    pipeline_options.do_picture_classification = enrich_picture_classes
+    pipeline_options.do_picture_description = enrich_picture_description
+    pipeline_options.do_ocr = ocr
+    if ocr and ocr_engine in ocr_engine_map:
+        OcrOptionsClass = ocr_engine_map[ocr_engine]
+        ocr_options_instance = OcrOptionsClass(force_full_page_ocr=force_ocr)
+        pipeline_options.ocr_options = ocr_options_instance
+    pipeline_options.do_table_structure = True
+    pipeline_options.table_structure_options.do_cell_matching = True
+    pipeline_options.generate_page_images = True
+    pipeline_options.table_structure_options.mode = TableFormerMode(table_mode)
+    pipeline_options.document_timeout = float(timeout_per_document)
+    pipeline_options.accelerator_options = AcceleratorOptions(
+        num_threads=num_threads, device=AcceleratorDevice.AUTO
+    )
+
+    backend_to_impl = {
+        PdfBackend.PYPDFIUM2.value: (
+            "docling.backend.pypdfium2_backend",
+            "PyPdfiumDocumentBackend",
+        ),
+        PdfBackend.DLPARSE_V1.value: (
+            "docling.backend.docling_parse_backend",
+            "DoclingParseDocumentBackend",
+        ),
+        PdfBackend.DLPARSE_V2.value: (
+            "docling.backend.docling_parse_v2_backend",
+            "DoclingParseV2DocumentBackend",
+        ),
+        PdfBackend.DLPARSE_V4.value: (
+            "docling.backend.docling_parse_v4_backend",
+            "DoclingParseV4DocumentBackend",
+        ),
+    }
+
+    module_name, class_name = backend_to_impl[pdf_backend]
+    backend_class = getattr(import_module(module_name), class_name)
+
+    doc_converter = DocumentConverter(
+        format_options={
+            InputFormat.PDF: PdfFormatOption(
+                pipeline_options=pipeline_options,
+                backend=backend_class,
+                pipeline_cls=StandardPdfPipeline,
+            )
+        }
+    )
+
+    easyocr_path_p = artifacts_path_p / "EasyOcr"
+    os.environ["MODULE_PATH"] = str(easyocr_path_p)
+    os.environ["EASYOCR_MODULE_PATH"] = str(easyocr_path_p)
+
+    results = doc_converter.convert_all(input_pdfs, raises_on_error=True)
+
+    for result in results:
+        doc_filename = result.input.file.stem
+
+        output_json_path = output_path_p / f"{doc_filename}.json"
+        print(f"docling-convert: saving {output_json_path}", flush=True)
+        result.document.save_as_json(output_json_path, image_mode=ImageRefMode(image_export_mode))
+
+        output_md_path = output_path_p / f"{doc_filename}.md"
+        print(f"docling-convert: saving {output_md_path}", flush=True)
+        result.document.save_as_markdown(output_md_path, image_mode=ImageRefMode(image_export_mode))
+
+    print("docling-convert: done", flush=True)
+
+@dsl.component(
+    base_image=DOCLING_BASE_IMAGE,
+)
+def docling_convert_vlm(
+    input_path: dsl.Input[dsl.Artifact],
+    artifacts_path: dsl.Input[dsl.Artifact],
+    output_path: dsl.Output[dsl.Artifact],
+    pdf_filenames: List[str],
+    num_threads: int = 4,
+    image_export_mode: str = "embedded",
+    timeout_per_document: int = 300,
+    remote_model_enabled: bool = False,
+    remote_model_secret_mount_path: str = "/mnt/secrets",
+):
+    """
+    Convert a list of PDF files to JSON and Markdown using Docling (VLM Pipeline).
+
+    Args:
+        input_path: Path to the input directory containing PDF files.
+        artifacts_path: Path to the directory containing Docling models.
+        output_path: Path to the output directory for converted JSON and Markdown files.
+        pdf_filenames: List of PDF file names to process.
+        num_threads: Number of threads to use per document processing.
+        timeout_per_document: Timeout per document processing.
+        image_export_mode: Mode to export images.
         remote_model_enabled: Whether or not to use a remote model.
         remote_model_secret_mount_path: Path to the remote model secret mount path.
     """
     import os
-    from importlib import import_module
     from pathlib import Path
 
-    from docling_core.types.doc.base import ImageRefMode  # pylint: disable=import-outside-toplevel  # noqa: PLC0415, E402
-    from docling.datamodel.base_models import InputFormat  # pylint: disable=import-outside-toplevel  # noqa: PLC0415, E402
-    from docling.datamodel.pipeline_options import (  # pylint: disable=import-outside-toplevel  # noqa: PLC0415, E402
-        VlmPipelineOptions,
-    )
-    from docling.pipeline.vlm_pipeline import VlmPipeline  # pylint: disable=import-outside-toplevel  # noqa: PLC0415, E402
-    from docling.document_converter import DocumentConverter, PdfFormatOption  # pylint: disable=import-outside-toplevel  # noqa: PLC0415, E402
-    from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions  # pylint: disable=import-outside-toplevel  # noqa: PLC0415, E402
-    from docling.datamodel.pipeline_options_vlm_model import ApiVlmOptions, ResponseFormat # pylint: disable=import-outside-toplevel  # noqa: PLC0415, E402
+    from docling_core.types.doc.base import ImageRefMode  # pylint: disable=import-outside-toplevel
+    from docling.datamodel.base_models import InputFormat  # pylint: disable=import-outside-toplevel
+    from docling.datamodel.pipeline_options import VlmPipelineOptions  # pylint: disable=import-outside-toplevel
+    from docling.pipeline.vlm_pipeline import VlmPipeline  # pylint: disable=import-outside-toplevel
+    from docling.document_converter import DocumentConverter, PdfFormatOption  # pylint: disable=import-outside-toplevel
+    from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions  # pylint: disable=import-outside-toplevel
+    from docling.datamodel.pipeline_options_vlm_model import ApiVlmOptions, ResponseFormat # pylint: disable=import-outside-toplevel
 
     input_path_p = Path(input_path.path)
     artifacts_path_p = Path(artifacts_path.path)
